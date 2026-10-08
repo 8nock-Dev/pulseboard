@@ -1,90 +1,75 @@
-const cron = require('node-cron');
 const { pool } = require('../config/db');
 const { checkMonitor } = require('./checker');
 
-// Map of monitorId -> cron.ScheduledTask
-const activeTasks = new Map();
+const POLL_MS = 15000;
+let pollTimer;
+let polling = false;
+let lastCleanupAt = 0;
 
-/**
- * Converts an interval in minutes to a cron expression.
- */
-function intervalToCron(minutes) {
-  const m = Number(minutes);
-  if (m === 1)  return '* * * * *';
-  if (m === 5)  return '*/5 * * * *';
-  if (m === 10) return '*/10 * * * *';
-  if (m === 15) return '*/15 * * * *';
-  if (m === 30) return '*/30 * * * *';
-  if (m === 60) return '0 * * * *';
-  return `*/${m} * * * *`;
+async function cleanupHistory() {
+  if (Date.now() - lastCleanupAt < 24 * 60 * 60 * 1000) return;
+  await pool.query("DELETE FROM checks WHERE checked_at < NOW() - INTERVAL '90 days'");
+  await pool.query("DELETE FROM incidents WHERE is_resolved = true AND resolved_at < NOW() - INTERVAL '365 days'");
+  lastCleanupAt = Date.now();
 }
 
-/**
- * Schedules a monitor for periodic checks.
- * If it was already scheduled, the old task is replaced.
- */
-function scheduleMonitor(monitor) {
-  // Clear existing task if any
-  if (activeTasks.has(monitor.id)) {
-    activeTasks.get(monitor.id).stop();
-    activeTasks.delete(monitor.id);
-  }
-
-  const cronExpr = intervalToCron(monitor.interval_minutes);
-
-  const task = cron.schedule(cronExpr, async () => {
-    try {
-      // Fetch the latest monitor state from DB (in case it was updated or deleted)
-      const result = await pool.query(
-        'SELECT * FROM monitors WHERE id = $1 AND is_active = true',
-        [monitor.id]
-      );
-
-      if (result.rows.length === 0) {
-        // Monitor was deactivated or deleted — stop the task
-        unscheduleMonitor(monitor.id);
-        return;
-      }
-
-      await checkMonitor(result.rows[0]);
-    } catch (err) {
-      console.error(`[Scheduler] Check failed for monitor ${monitor.id}:`, err.message);
-    }
-  });
-
-  activeTasks.set(monitor.id, task);
-  console.log(`[Scheduler] Scheduled: "${monitor.name}" every ${monitor.interval_minutes}m (${cronExpr})`);
+async function claimDueMonitors(limit = 20) {
+  const { rows } = await pool.query(
+    `WITH due AS (
+       SELECT id
+       FROM monitors
+       WHERE is_active = true AND COALESCE(next_check_at, NOW()) <= NOW()
+       ORDER BY next_check_at NULLS FIRST
+       FOR UPDATE SKIP LOCKED
+       LIMIT $1
+     )
+     UPDATE monitors m
+     SET next_check_at = NOW() + make_interval(mins => m.interval_minutes)
+     FROM due
+     WHERE m.id = due.id
+     RETURNING m.*`,
+    [limit]
+  );
+  return rows;
 }
 
-/**
- * Stops and removes a monitor's scheduled task.
- */
-function unscheduleMonitor(monitorId) {
-  if (activeTasks.has(monitorId)) {
-    activeTasks.get(monitorId).stop();
-    activeTasks.delete(monitorId);
-    console.log(`[Scheduler] Unscheduled monitor: ${monitorId}`);
-  }
-}
-
-/**
- * Called at startup — loads all active monitors and schedules them.
- */
-async function initScheduler() {
+async function poll() {
+  if (polling) return;
+  polling = true;
   try {
-    const result = await pool.query(
-      'SELECT * FROM monitors WHERE is_active = true'
-    );
-
-    for (const monitor of result.rows) {
-      scheduleMonitor(monitor);
-    }
-
-    console.log(`[Scheduler] Initialized with ${result.rows.length} active monitors`);
-  } catch (err) {
-    console.error('[Scheduler] Initialization failed:', err.message);
-    throw err;
+    const monitors = await claimDueMonitors();
+    const results = await Promise.allSettled(monitors.map((monitor) => checkMonitor(monitor)));
+    results.forEach((result, index) => {
+      if (result.status === 'rejected') {
+        console.error(`[Scheduler] Check failed for ${monitors[index].id}:`, result.reason?.message || result.reason);
+      }
+    });
+    await cleanupHistory();
+  } catch (error) {
+    console.error('[Scheduler] Poll failed:', error.message);
+  } finally {
+    polling = false;
   }
 }
 
-module.exports = { scheduleMonitor, unscheduleMonitor, initScheduler };
+async function scheduleMonitor(monitor) {
+  await pool.query('UPDATE monitors SET next_check_at = NOW() WHERE id = $1', [monitor.id]);
+}
+
+async function unscheduleMonitor(monitorId) {
+  await pool.query('UPDATE monitors SET next_check_at = NULL WHERE id = $1', [monitorId]);
+}
+
+async function initScheduler() {
+  await poll();
+  pollTimer = setInterval(poll, POLL_MS);
+  pollTimer.unref?.();
+  console.log(`[Scheduler] Durable database poller started (${POLL_MS / 1000}s interval)`);
+}
+
+function stopScheduler() {
+  if (pollTimer) clearInterval(pollTimer);
+  pollTimer = null;
+}
+
+module.exports = { claimDueMonitors, cleanupHistory, poll, scheduleMonitor, unscheduleMonitor, initScheduler, stopScheduler };

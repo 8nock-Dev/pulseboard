@@ -1,137 +1,112 @@
-const axios = require('axios');
 const { pool } = require('../config/db');
 const { sendAlert } = require('./alerting');
 const { emitToUser } = require('./events');
+const { safeRequest } = require('../security/safeHttp');
 
-/**
- * Performs a single check against a monitor's URL,
- * records the result, manages incidents, and emits SSE events.
- *
- * @param {Object} monitor - Monitor row from the database
- * @returns {Object} Check result
- */
-async function checkMonitor(monitor) {
-  const startTime = Date.now();
-  let status = 'up';
-  let responseTimeMs = null;
-  let statusCode = null;
-  let errorMessage = null;
-
-  // ─── Perform the HTTP check ───────────────────────────
+async function performRequest(monitor) {
+  const startedAt = Date.now();
   try {
-    const response = await axios({
+    const response = await safeRequest({
       method: 'GET',
       url: monitor.url,
-      timeout: monitor.timeout_seconds * 1000,
-      validateStatus: () => true, // Never throw on HTTP status
-      headers: {
-        'User-Agent': 'PulseBoard-Monitor/1.0',
-      },
-      maxRedirects: 5,
+      timeout: Math.min(Number(monitor.timeout_seconds) || 10, 30) * 1000,
+      headers: { 'User-Agent': 'PulseBoard-Monitor/1.0' },
     });
-
-    responseTimeMs = Date.now() - startTime;
-    statusCode = response.status;
-
-    if (response.status !== monitor.expected_status_code) {
-      status = 'down';
-      errorMessage = `Expected HTTP ${monitor.expected_status_code}, received ${response.status}`;
-    }
-  } catch (err) {
-    responseTimeMs = Date.now() - startTime;
-
-    if (err.code === 'ECONNABORTED' || err.code === 'ETIMEDOUT' || err.message.includes('timeout')) {
-      status = 'timeout';
-      errorMessage = `Request timed out after ${monitor.timeout_seconds}s`;
-    } else if (err.code === 'ENOTFOUND') {
-      status = 'down';
-      errorMessage = `DNS resolution failed: ${err.hostname || monitor.url}`;
-    } else if (err.code === 'ECONNREFUSED') {
-      status = 'down';
-      errorMessage = 'Connection refused';
-    } else {
-      status = 'down';
-      errorMessage = err.message;
-    }
+    const isUp = response.status === monitor.expected_status_code;
+    return {
+      status: isUp ? 'up' : 'down',
+      responseTimeMs: Date.now() - startedAt,
+      statusCode: response.status,
+      errorMessage: isUp ? null : `Expected HTTP ${monitor.expected_status_code}, received ${response.status}`,
+    };
+  } catch (error) {
+    const timedOut = error.code === 'ECONNABORTED' || error.code === 'ETIMEDOUT' || error.message.includes('timeout');
+    return {
+      status: timedOut ? 'timeout' : 'down',
+      responseTimeMs: Date.now() - startedAt,
+      statusCode: null,
+      errorMessage: timedOut ? `Request timed out after ${monitor.timeout_seconds}s` : error.message,
+    };
   }
-
-  // Normalize timeout → down for status tracking
-  const normalizedStatus = status === 'timeout' ? 'down' : status;
-
-  // ─── Record check result ──────────────────────────────
-  await pool.query(
-    `INSERT INTO checks (monitor_id, status, response_time_ms, status_code, error_message)
-     VALUES ($1, $2, $3, $4, $5)`,
-    [monitor.id, status, responseTimeMs, statusCode, errorMessage]
-  );
-
-  // ─── Recalculate uptime (last 30 days) ───────────────
-  const uptimeResult = await pool.query(
-    `SELECT
-        COUNT(*) FILTER (WHERE status = 'up') AS up_count,
-        COUNT(*) AS total_count
-      FROM checks
-      WHERE monitor_id = $1
-        AND checked_at > NOW() - INTERVAL '30 days'`,
-    [monitor.id]
-  );
-
-  const { up_count, total_count } = uptimeResult.rows[0];
-  const uptimePercentage = total_count > 0
-    ? ((parseInt(up_count) / parseInt(total_count)) * 100).toFixed(2)
-    : '100.00';
-
-  const previousStatus = monitor.current_status;
-
-  // ─── Update monitor state ─────────────────────────────
-  await pool.query(
-    `UPDATE monitors SET
-        current_status    = $1,
-        last_checked_at   = NOW(),
-        uptime_percentage = $2
-      WHERE id = $3`,
-    [normalizedStatus, uptimePercentage, monitor.id]
-  );
-
-  // ─── Incident management ──────────────────────────────
-  if (previousStatus !== 'down' && normalizedStatus === 'down') {
-    // Service just went DOWN — open a new incident
-    await pool.query(
-      'INSERT INTO incidents (monitor_id, root_cause) VALUES ($1, $2)',
-      [monitor.id, errorMessage]
-    );
-    await sendAlert(monitor, 'down', errorMessage).catch(err =>
-      console.error(`[Alert failed] ${err.message}`)
-    );
-    console.log(`[DOWN] ${monitor.name} | ${errorMessage}`);
-  } else if (previousStatus === 'down' && normalizedStatus === 'up') {
-    // Service just RECOVERED — resolve open incidents
-    await pool.query(
-      `UPDATE incidents SET
-          is_resolved      = true,
-          resolved_at      = NOW(),
-          duration_minutes = EXTRACT(EPOCH FROM (NOW() - started_at)) / 60
-        WHERE monitor_id = $1 AND is_resolved = false`,
-      [monitor.id]
-    );
-    await sendAlert(monitor, 'up', null).catch(err =>
-      console.error(`[Alert failed] ${err.message}`)
-    );
-    console.log(`[UP] ${monitor.name} recovered | Response: ${responseTimeMs}ms`);
-  }
-
-  // ─── Emit real-time update via SSE ────────────────────
-  emitToUser(monitor.user_id, {
-    type: 'monitor_update',
-    monitorId: monitor.id,
-    status: normalizedStatus,
-    responseTimeMs,
-    statusCode,
-    uptimePercentage: parseFloat(uptimePercentage),
-    lastCheckedAt: new Date().toISOString(),
-  });
-
-  return { status, responseTimeMs, statusCode, errorMessage };
 }
 
-module.exports = { checkMonitor };
+async function recordResult(monitor, result) {
+  const client = await pool.connect();
+  const normalizedStatus = result.status === 'timeout' ? 'down' : result.status;
+  let transition = null;
+  let uptimePercentage = 100;
+
+  try {
+    await client.query('BEGIN');
+    await client.query(
+      `INSERT INTO checks (monitor_id, status, response_time_ms, status_code, error_message)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [monitor.id, result.status, result.responseTimeMs, result.statusCode, result.errorMessage]
+    );
+
+    const state = await client.query('SELECT current_status FROM monitors WHERE id = $1 FOR UPDATE', [monitor.id]);
+    if (!state.rows.length) {
+      await client.query('ROLLBACK');
+      return { transition: null, uptimePercentage };
+    }
+    const previousStatus = state.rows[0].current_status;
+    const uptime = await client.query(
+      `SELECT COUNT(*) FILTER (WHERE status = 'up') AS up_count, COUNT(*) AS total_count
+       FROM checks WHERE monitor_id = $1 AND checked_at > NOW() - INTERVAL '30 days'`,
+      [monitor.id]
+    );
+    const upCount = Number(uptime.rows[0].up_count);
+    const totalCount = Number(uptime.rows[0].total_count);
+    uptimePercentage = totalCount ? Number(((upCount / totalCount) * 100).toFixed(2)) : 100;
+
+    await client.query(
+      `UPDATE monitors SET current_status = $1, last_checked_at = NOW(), uptime_percentage = $2 WHERE id = $3`,
+      [normalizedStatus, uptimePercentage, monitor.id]
+    );
+
+    if (previousStatus !== 'down' && normalizedStatus === 'down') {
+      await client.query(
+        `INSERT INTO incidents (monitor_id, root_cause) VALUES ($1, $2)
+         ON CONFLICT (monitor_id) WHERE is_resolved = false DO NOTHING`,
+        [monitor.id, result.errorMessage]
+      );
+      transition = 'down';
+    } else if (previousStatus === 'down' && normalizedStatus === 'up') {
+      await client.query(
+        `UPDATE incidents SET is_resolved = true, resolved_at = NOW(),
+          duration_minutes = EXTRACT(EPOCH FROM (NOW() - started_at)) / 60
+         WHERE monitor_id = $1 AND is_resolved = false`,
+        [monitor.id]
+      );
+      transition = 'up';
+    }
+    await client.query('COMMIT');
+    return { transition, uptimePercentage };
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+async function checkMonitor(monitor) {
+  const result = await performRequest(monitor);
+  const { transition, uptimePercentage } = await recordResult(monitor, result);
+
+  if (transition) {
+    await sendAlert(monitor, transition, result.errorMessage).catch((error) =>
+      console.error(`[Alert failed] ${error.message}`)
+    );
+  }
+
+  await emitToUser(monitor.user_id, {
+    type: 'monitor_update', monitorId: monitor.id,
+    status: result.status === 'timeout' ? 'down' : result.status,
+    responseTimeMs: result.responseTimeMs, statusCode: result.statusCode,
+    uptimePercentage, lastCheckedAt: new Date().toISOString(),
+  });
+  return result;
+}
+
+module.exports = { checkMonitor, performRequest, recordResult };

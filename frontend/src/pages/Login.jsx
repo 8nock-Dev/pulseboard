@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { Link } from 'react-router-dom';
 import { useAuth } from '../context/AuthContext';
 import api from '../api/client';
 
@@ -132,9 +133,10 @@ export default function Login() {
             </div>
 
             <div>
-              <label className="block text-sm font-medium text-stone-700 mb-1.5">
-                Password
-              </label>
+              <div className="flex justify-between items-center mb-1.5">
+                <label className="block text-sm font-medium text-stone-700">Password</label>
+                {mode === 'login' && <Link to="/forgot-password" className="text-xs font-medium text-stone-700 hover:underline">Forgot password?</Link>}
+              </div>
               <input
                 type="password"
                 name="password"

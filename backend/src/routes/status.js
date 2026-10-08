@@ -6,11 +6,11 @@ const router = express.Router();
 // ─── GET /api/status/:userId ──────────────────────────────
 // Public endpoint — no auth required
 // Used by the public status page at /status/:userId
-router.get('/:userId', async (req, res) => {
+router.get('/:slug', async (req, res) => {
   try {
     const userResult = await pool.query(
-      'SELECT id, name FROM users WHERE id = $1',
-      [req.params.userId]
+      'SELECT id, name FROM users WHERE status_slug = $1',
+      [req.params.slug]
     );
     if (userResult.rows.length === 0) {
       return res.status(404).json({ error: 'Status page not found' });
@@ -18,11 +18,11 @@ router.get('/:userId', async (req, res) => {
 
     const monitorsResult = await pool.query(
       `SELECT 
-          id, name, url, current_status, last_checked_at, uptime_percentage
+          id, COALESCE(public_name, name) AS name, current_status, last_checked_at, uptime_percentage
         FROM monitors
-        WHERE user_id = $1 AND is_active = true
+        WHERE user_id = $1 AND is_active = true AND public_visible = true
         ORDER BY created_at ASC`,
-      [req.params.userId]
+      [userResult.rows[0].id]
     );
 
     const incidentsResult = await pool.query(
@@ -32,9 +32,10 @@ router.get('/:userId', async (req, res) => {
         FROM incidents i
         JOIN monitors m ON m.id = i.monitor_id
         WHERE m.user_id = $1
+          AND m.public_visible = true
         ORDER BY i.started_at DESC
         LIMIT 15`,
-      [req.params.userId]
+      [userResult.rows[0].id]
     );
 
     const monitors = monitorsResult.rows;

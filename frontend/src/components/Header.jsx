@@ -24,7 +24,7 @@ export default function Header() {
           {user && (
             <>
               <Link
-                to={`/status/${user.id}`}
+                to={`/status/${user.status_slug}`}
                 target="_blank"
                 className="text-sm text-stone-500 hover:text-stone-900 transition-colors flex items-center gap-1.5"
               >

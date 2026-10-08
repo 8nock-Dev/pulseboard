@@ -17,6 +17,8 @@ const DEFAULT_FORM = {
   expected_status_code: 200,
   notify_email: '',
   notify_webhook: '',
+  public_visible: false,
+  public_name: '',
 };
 
 export default function MonitorModal({ monitor, onSave, onClose }) {
@@ -37,13 +39,15 @@ export default function MonitorModal({ monitor, onSave, onClose }) {
         expected_status_code: monitor.expected_status_code || 200,
         notify_email:         monitor.notify_email || '',
         notify_webhook:       monitor.notify_webhook || '',
+        public_visible:       Boolean(monitor.public_visible),
+        public_name:          monitor.public_name || '',
       });
     }
   }, [monitor]);
 
   function handleChange(e) {
-    const { name, value } = e.target;
-    setForm(prev => ({ ...prev, [name]: value }));
+    const { name, value, type, checked } = e.target;
+    setForm(prev => ({ ...prev, [name]: type === 'checkbox' ? checked : value }));
     setErrors(prev => ({ ...prev, [name]: '' }));
   }
 
@@ -75,6 +79,7 @@ export default function MonitorModal({ monitor, onSave, onClose }) {
         expected_status_code: Number(form.expected_status_code),
         notify_email:         form.notify_email.trim() || null,
         notify_webhook:       form.notify_webhook.trim() || null,
+        public_name:          form.public_name.trim() || null,
       });
     } finally {
       setLoading(false);
@@ -169,7 +174,7 @@ export default function MonitorModal({ monitor, onSave, onClose }) {
                       value={form.timeout_seconds}
                       onChange={handleChange}
                       min={1}
-                      max={60}
+                      max={30}
                       className={inputClass()}
                     />
                   </Field>
@@ -189,6 +194,32 @@ export default function MonitorModal({ monitor, onSave, onClose }) {
                     Any response other than this code will trigger a DOWN alert.
                   </p>
                 </Field>
+
+                <label className="flex items-start gap-3 rounded-lg border border-stone-200 p-3">
+                  <input
+                    type="checkbox"
+                    name="public_visible"
+                    checked={form.public_visible}
+                    onChange={handleChange}
+                    className="mt-1"
+                  />
+                  <span>
+                    <span className="block text-sm font-medium text-stone-700">Show on public status page</span>
+                    <span className="block text-xs text-stone-400">The target URL stays private.</span>
+                  </span>
+                </label>
+
+                {form.public_visible && (
+                  <Field label="Public service name">
+                    <input
+                      name="public_name"
+                      value={form.public_name}
+                      onChange={handleChange}
+                      placeholder={form.name || 'Website'}
+                      className={inputClass()}
+                    />
+                  </Field>
+                )}
               </>
             )}
 

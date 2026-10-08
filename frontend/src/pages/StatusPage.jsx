@@ -121,7 +121,6 @@ export default function StatusPage() {
                     }`} />
                     <div>
                       <p className="text-sm font-medium text-stone-900">{m.name}</p>
-                      <p className="text-xs text-stone-400 font-mono">{m.url}</p>
                     </div>
                   </div>
                   <div className="text-right">

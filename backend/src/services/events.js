@@ -1,36 +1,51 @@
-// In-memory store mapping userId -> Set<Response>
-// When a monitor check completes, we emit the result to all connected
-// browser tabs belonging to that user via Server-Sent Events.
+const { pool } = require('../config/db');
+
 const clients = new Map();
+let listener;
 
 function addClient(userId, res) {
-  if (!clients.has(userId)) {
-    clients.set(userId, new Set());
-  }
+  if (!clients.has(userId)) clients.set(userId, new Set());
   clients.get(userId).add(res);
-  console.log(`[SSE] Client connected: ${userId} (total: ${clients.get(userId).size})`);
 }
 
 function removeClient(userId, res) {
-  if (!clients.has(userId)) return;
-  clients.get(userId).delete(res);
-  if (clients.get(userId).size === 0) {
-    clients.delete(userId);
-  }
+  clients.get(userId)?.delete(res);
+  if (clients.get(userId)?.size === 0) clients.delete(userId);
 }
 
-function emitToUser(userId, payload) {
-  const userClients = clients.get(userId);
-  if (!userClients || userClients.size === 0) return;
-
+function broadcast(userId, payload) {
   const message = `data: ${JSON.stringify(payload)}\n\n`;
-  userClients.forEach((res) => {
-    try {
-      res.write(message);
-    } catch {
-      // Client disconnected — the 'close' event will handle cleanup
-    }
+  clients.get(userId)?.forEach((response) => {
+    try { response.write(message); } catch { removeClient(userId, response); }
   });
 }
 
-module.exports = { addClient, removeClient, emitToUser };
+async function initEvents() {
+  listener = await pool.connect();
+  await listener.query('LISTEN pulseboard_events');
+  listener.on('notification', (notification) => {
+    try {
+      const { userId, payload } = JSON.parse(notification.payload);
+      broadcast(userId, payload);
+    } catch (error) { console.error('[Events]', error.message); }
+  });
+  listener.on('error', (error) => console.error('[Events listener]', error.message));
+}
+
+async function emitToUser(userId, payload) {
+  const message = JSON.stringify({ userId, payload });
+  if (Buffer.byteLength(message) > 7900) throw new Error('Event payload is too large');
+  await pool.query('SELECT pg_notify($1, $2)', ['pulseboard_events', message]);
+}
+
+async function stopEvents() {
+  clients.forEach((responses) => responses.forEach((response) => response.end()));
+  clients.clear();
+  if (listener) {
+    await listener.query('UNLISTEN pulseboard_events').catch(() => {});
+    listener.release();
+    listener = null;
+  }
+}
+
+module.exports = { addClient, removeClient, emitToUser, initEvents, stopEvents };

@@ -1,5 +1,5 @@
-const axios = require('axios');
 const { sendEmail } = require('../config/mailer');
+const { safeRequest } = require('../security/safeHttp');
 
 const APP_URL = process.env.APP_URL || 'http://localhost:5173';
 
@@ -123,7 +123,13 @@ async function sendAlert(monitor, status, errorMessage) {
         ...payload,
       };
 
-      await axios.post(monitor.notify_webhook, slackPayload, { timeout: 10000 });
+      await safeRequest({
+        method: 'POST',
+        url: monitor.notify_webhook,
+        data: slackPayload,
+        timeout: 10000,
+        headers: { 'Content-Type': 'application/json' },
+      }, { maxRedirects: 1, maxContentLength: 256 * 1024 });
     } catch (err) {
       console.error(`[Webhook alert failed] ${err.message}`);
     }

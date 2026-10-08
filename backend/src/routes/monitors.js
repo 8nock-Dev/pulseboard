@@ -2,7 +2,7 @@ const express = require('express');
 const { pool } = require('../config/db');
 const { authenticate } = require('../middleware/auth');
 const { scheduleMonitor, unscheduleMonitor } = require('../services/scheduler');
-const { checkMonitor } = require('../services/checker');
+const { assertSafeUrl } = require('../security/urlSafety');
 
 const router = express.Router();
 router.use(authenticate);
@@ -126,15 +126,19 @@ router.post('/', async (req, res) => {
     expected_status_code = 200,
     notify_email,
     notify_webhook,
+    public_visible = false,
+    public_name,
   } = req.body;
 
   if (!name || !url) {
     return res.status(400).json({ error: 'Name and URL are required' });
   }
 
-  // Basic URL validation
-  try { new URL(url); } catch {
-    return res.status(400).json({ error: 'Invalid URL format' });
+  try {
+    await assertSafeUrl(url);
+    if (notify_webhook) await assertSafeUrl(notify_webhook);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
   }
 
   const validIntervals = [1, 5, 10, 15, 30, 60];
@@ -145,19 +149,19 @@ router.post('/', async (req, res) => {
   try {
     const result = await pool.query(
       `INSERT INTO monitors 
-          (user_id, name, url, type, interval_minutes, timeout_seconds, expected_status_code, notify_email, notify_webhook)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          (user_id, name, url, type, interval_minutes, timeout_seconds, expected_status_code,
+           notify_email, notify_webhook, public_visible, public_name, next_check_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NOW())
         RETURNING *`,
-      [req.user.userId, name.trim(), url.trim(), type, interval_minutes, timeout_seconds, expected_status_code, notify_email || null, notify_webhook || null]
+      [req.user.userId, name.trim(), url.trim(), type, interval_minutes, timeout_seconds,
+        expected_status_code, notify_email || null, notify_webhook || null,
+        Boolean(public_visible), public_name?.trim() || null]
     );
 
     const monitor = result.rows[0];
 
     // Schedule the monitor for periodic checks
-    scheduleMonitor(monitor);
-
-    // Run an immediate first check in the background (don't await)
-    checkMonitor(monitor).catch(err => console.error('[Initial check failed]', err.message));
+    await scheduleMonitor(monitor);
 
     res.status(201).json(monitor);
   } catch (err) {
@@ -171,7 +175,21 @@ router.put('/:id', async (req, res) => {
   const {
     name, url, type, interval_minutes, timeout_seconds,
     expected_status_code, is_active, notify_email, notify_webhook,
+    public_visible, public_name,
   } = req.body;
+
+  try {
+    if (url) await assertSafeUrl(url);
+    if (notify_webhook) await assertSafeUrl(notify_webhook);
+  } catch (error) {
+    return res.status(400).json({ error: error.message });
+  }
+  if (interval_minutes !== undefined && ![1, 5, 10, 15, 30, 60].includes(Number(interval_minutes))) {
+    return res.status(400).json({ error: 'Invalid interval_minutes' });
+  }
+  if (timeout_seconds !== undefined && (Number(timeout_seconds) < 1 || Number(timeout_seconds) > 30)) {
+    return res.status(400).json({ error: 'timeout_seconds must be between 1 and 30' });
+  }
 
   try {
     const result = await pool.query(
@@ -185,19 +203,22 @@ router.put('/:id', async (req, res) => {
           is_active            = COALESCE($7, is_active),
           notify_email         = $8,
           notify_webhook       = $9,
+          public_visible       = COALESCE($10, public_visible),
+          public_name          = $11,
           updated_at           = NOW()
-        WHERE id = $10 AND user_id = $11
+        WHERE id = $12 AND user_id = $13
         RETURNING *`,
       [name, url, type, interval_minutes, timeout_seconds, expected_status_code,
         is_active, notify_email || null, notify_webhook || null,
+        public_visible === undefined ? null : Boolean(public_visible), public_name?.trim() || null,
         req.params.id, req.user.userId]
     );
 
     if (result.rows.length === 0) return res.status(404).json({ error: 'Monitor not found' });
 
     const monitor = result.rows[0];
-    unscheduleMonitor(monitor.id);
-    if (monitor.is_active) scheduleMonitor(monitor);
+    await unscheduleMonitor(monitor.id);
+    if (monitor.is_active) await scheduleMonitor(monitor);
 
     res.json(monitor);
   } catch (err) {
@@ -215,7 +236,7 @@ router.delete('/:id', async (req, res) => {
     );
     if (result.rows.length === 0) return res.status(404).json({ error: 'Monitor not found' });
 
-    unscheduleMonitor(req.params.id);
+    await unscheduleMonitor(req.params.id);
     console.log(`[Monitor deleted] ${result.rows[0].name}`);
     res.json({ message: 'Monitor deleted successfully' });
   } catch (err) {

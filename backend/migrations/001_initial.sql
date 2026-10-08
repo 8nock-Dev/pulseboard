@@ -12,8 +12,19 @@ CREATE TABLE IF NOT EXISTS users (
   email        VARCHAR(255) UNIQUE NOT NULL,
   password_hash VARCHAR(255) NOT NULL,
   name         VARCHAR(255) NOT NULL,
+  status_slug  VARCHAR(64) UNIQUE NOT NULL DEFAULT encode(gen_random_bytes(16), 'hex'),
   created_at   TIMESTAMPTZ DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS password_reset_tokens (
+  user_id      UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  token_hash   VARCHAR(64) UNIQUE NOT NULL,
+  expires_at   TIMESTAMPTZ NOT NULL,
+  created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_password_reset_tokens_expiry
+  ON password_reset_tokens(expires_at);
 
 -- ─────────────────────────────────────────
 -- MONITORS
@@ -33,6 +44,9 @@ CREATE TABLE IF NOT EXISTS monitors (
   uptime_percentage    DECIMAL(5,2) DEFAULT 100.00,
   notify_email         VARCHAR(255),
   notify_webhook       TEXT,
+  next_check_at        TIMESTAMPTZ DEFAULT NOW(),
+  public_visible       BOOLEAN DEFAULT false,
+  public_name          VARCHAR(255),
   created_at           TIMESTAMPTZ DEFAULT NOW(),
   updated_at           TIMESTAMPTZ DEFAULT NOW()
 );
@@ -72,3 +86,15 @@ CREATE INDEX IF NOT EXISTS idx_checks_monitor_time  ON checks(monitor_id, checke
 CREATE INDEX IF NOT EXISTS idx_incidents_monitor_id ON incidents(monitor_id);
 CREATE INDEX IF NOT EXISTS idx_monitors_user_id     ON monitors(user_id);
 CREATE INDEX IF NOT EXISTS idx_monitors_active      ON monitors(is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_monitors_due         ON monitors(next_check_at) WHERE is_active = true;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_one_open_incident
+  ON incidents(monitor_id) WHERE is_resolved = false;
+
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS next_check_at TIMESTAMPTZ DEFAULT NOW();
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS public_visible BOOLEAN DEFAULT false;
+ALTER TABLE monitors ADD COLUMN IF NOT EXISTS public_name VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS status_slug VARCHAR(64);
+UPDATE users SET status_slug = encode(gen_random_bytes(16), 'hex') WHERE status_slug IS NULL;
+ALTER TABLE users ALTER COLUMN status_slug SET DEFAULT encode(gen_random_bytes(16), 'hex');
+ALTER TABLE users ALTER COLUMN status_slug SET NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_status_slug ON users(status_slug);

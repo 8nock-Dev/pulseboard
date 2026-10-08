@@ -9,6 +9,7 @@ function authenticate(req, res, next) {
   const token = authHeader.split(' ')[1];
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.tokenType === 'sse') throw new Error('Wrong token type');
     req.user = payload;
     next();
   } catch (err) {
@@ -25,6 +26,7 @@ function authenticateSSE(req, res, next) {
 
   try {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
+    if (payload.tokenType !== 'sse') throw new Error('Wrong token type');
     req.user = payload;
     next();
   } catch (err) {

@@ -33,10 +33,14 @@ export default function Dashboard() {
   // ─── SSE real-time connection ──────────────────────────
   useEffect(() => {
     if (!token) return;
+    let reconnectTimer;
+    let cancelled = false;
 
-    function connect() {
+    async function connect() {
+      const tokenResponse = await api.post('/auth/sse-token');
+      if (cancelled) return;
       const apiBase = import.meta.env.VITE_API_URL || '/api';
-      const url     = `${apiBase}/events?token=${token}`;
+      const url     = `${apiBase}/events?token=${encodeURIComponent(tokenResponse.data.token)}`;
 
       const es = new EventSource(url);
       esRef.current = es;
@@ -69,13 +73,15 @@ export default function Dashboard() {
         setSseStatus('offline');
         es.close();
         // Reconnect after 5 seconds
-        setTimeout(connect, 5000);
+        reconnectTimer = setTimeout(() => connect().catch(() => setSseStatus('offline')), 5000);
       };
     }
 
-    connect();
+    connect().catch(() => setSseStatus('offline'));
 
     return () => {
+      cancelled = true;
+      clearTimeout(reconnectTimer);
       esRef.current?.close();
     };
   }, [token]);
@@ -179,7 +185,7 @@ export default function Dashboard() {
               </p>
             </div>
             <a
-              href={`/status/${user.id}`}
+              href={`/status/${user.status_slug}`}
               target="_blank"
               rel="noopener noreferrer"
               className="flex items-center gap-1.5 px-4 py-2 border border-stone-300 text-sm font-medium text-stone-700 rounded-lg hover:bg-stone-50 transition-colors whitespace-nowrap"
